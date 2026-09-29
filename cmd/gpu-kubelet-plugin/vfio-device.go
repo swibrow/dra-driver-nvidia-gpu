@@ -435,23 +435,64 @@ func (vm *VfioPciManager) enableGPUPersistenceMode(pciAddress string) error {
 }
 
 // Disable GPU Persistence Mode.
+// persistencedNvidiaSMI returns where to run nvidia-smi from to reach a running
+// nvidia-persistenced: chrooted into the device root when the daemon's socket
+// is under the driver root, or into the host root when it is only there. The
+// latter covers hosts whose driver root is not the root filesystem but which
+// run the daemon from it (e.g. Talos: driver under /usr/local, socket under
+// /run). ok is false when the daemon is not running.
+func (vm *VfioPciManager) persistencedNvidiaSMI() (chrootDir, nvidiaSMI string, ok bool, err error) {
+	socket := filepath.Join(vm.containerDriverRoot, nvidiaPersistencedSocketPath)
+	klog.V(4).Infof("Checking if nvidia-persistenced is running: %s", socket)
+	if _, err := os.Stat(socket); err == nil {
+		return vm.nvlib.devRoot, "nvidia-smi", true, nil
+	} else if !os.IsNotExist(err) {
+		return "", "", false, err
+	}
+
+	hostRoot := vm.nvlib.hostRoot
+	if hostRoot == "" {
+		return "", "", false, nil
+	}
+	socket = filepath.Join(hostRoot, nvidiaPersistencedSocketPath)
+	klog.V(4).Infof("Checking if nvidia-persistenced is running: %s", socket)
+	if _, err := os.Stat(socket); err != nil {
+		if os.IsNotExist(err) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	path, err := root(filepath.Join(hostRoot, vm.hostDriverRoot)).getNvidiaSMIPath()
+	if err != nil {
+		return "", "", false, fmt.Errorf("nvidia-persistenced socket found at %q but no nvidia-smi under the host driver root: %w", socket, err)
+	}
+	resolvedHostRoot, err := filepath.EvalSymlinks(hostRoot)
+	if err != nil {
+		return "", "", false, fmt.Errorf("error resolving host root %q: %w", hostRoot, err)
+	}
+	rel, err := filepath.Rel(resolvedHostRoot, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", "", false, fmt.Errorf("nvidia-smi at %q is outside the host root %q", path, hostRoot)
+	}
+	return hostRoot, "/" + rel, true, nil
+}
+
 func (vm *VfioPciManager) disableGPUPersistenceMode(pciAddress string) error {
 	// Obtain a lock to serialize persistence mode operations.
 	// This is a cautious approach to avoid any NVML race conditions.
 	vm.Lock()
 	defer vm.Unlock()
 	// We dont need to toggle persistence mode if nvidia-persistenced is not running.
-	klog.V(4).Infof("Checking if nvidia-persistenced is running: %s", filepath.Join(vm.containerDriverRoot, nvidiaPersistencedSocketPath))
-	_, err := os.Stat(filepath.Join(vm.containerDriverRoot, nvidiaPersistencedSocketPath))
+	chrootDir, nvidiaSMI, running, err := vm.persistencedNvidiaSMI()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("error checking if nvidia-persistenced is running: %w", err)
-		}
+		return fmt.Errorf("error checking if nvidia-persistenced is running: %w", err)
+	}
+	if !running {
 		klog.V(4).Infof("nvidia-persistenced is not running; nothing to do...")
 		return nil
 	}
 
-	err = vm.nvlib.disableGPUPersistenceMode(pciAddress)
+	err = vm.nvlib.disableGPUPersistenceMode(pciAddress, chrootDir, nvidiaSMI)
 	if err != nil {
 		return fmt.Errorf("error disabling persistence mode for GPU %q: %w", pciAddress, err)
 	}

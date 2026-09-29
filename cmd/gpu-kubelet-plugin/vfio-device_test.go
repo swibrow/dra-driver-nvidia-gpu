@@ -132,3 +132,83 @@ func requireEventuallyClosed(t *testing.T, ch <-chan struct{}) {
 		t.Fatal("timed out waiting for channel to close")
 	}
 }
+
+func TestPersistencedNvidiaSMI(t *testing.T) {
+	writeFile := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		name          string
+		setup         func(t *testing.T, driverRoot, hostRoot string)
+		wantHostRoot  bool
+		wantNvidiaSMI string
+		wantOK        bool
+		wantErr       bool
+	}{
+		{
+			name: "socket under driver root",
+			setup: func(t *testing.T, driverRoot, _ string) {
+				writeFile(t, filepath.Join(driverRoot, nvidiaPersistencedSocketPath))
+			},
+			wantNvidiaSMI: "nvidia-smi",
+			wantOK:        true,
+		},
+		{
+			name: "socket only under host root",
+			setup: func(t *testing.T, _, hostRoot string) {
+				writeFile(t, filepath.Join(hostRoot, nvidiaPersistencedSocketPath))
+				writeFile(t, filepath.Join(hostRoot, "usr/local/bin/nvidia-smi"))
+			},
+			wantHostRoot:  true,
+			wantNvidiaSMI: "/usr/local/bin/nvidia-smi",
+			wantOK:        true,
+		},
+		{
+			name: "socket under host root without nvidia-smi",
+			setup: func(t *testing.T, _, hostRoot string) {
+				writeFile(t, filepath.Join(hostRoot, nvidiaPersistencedSocketPath))
+			},
+			wantErr: true,
+		},
+		{
+			name:  "not running",
+			setup: func(t *testing.T, _, _ string) {},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			driverRoot, hostRoot := t.TempDir(), t.TempDir()
+			tc.setup(t, driverRoot, hostRoot)
+			vm := &VfioPciManager{
+				containerDriverRoot: driverRoot,
+				hostDriverRoot:      "/usr/local",
+				nvlib:               &deviceLib{devRoot: "/", hostRoot: hostRoot},
+			}
+
+			chrootDir, nvidiaSMI, ok, err := vm.persistencedNvidiaSMI()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if ok != tc.wantOK || nvidiaSMI != tc.wantNvidiaSMI {
+				t.Errorf("got (%q, %v), want (%q, %v)", nvidiaSMI, ok, tc.wantNvidiaSMI, tc.wantOK)
+			}
+			wantChroot := ""
+			if tc.wantOK {
+				wantChroot = "/"
+				if tc.wantHostRoot {
+					wantChroot = hostRoot
+				}
+			}
+			if chrootDir != wantChroot {
+				t.Errorf("chrootDir = %q, want %q", chrootDir, wantChroot)
+			}
+		})
+	}
+}
