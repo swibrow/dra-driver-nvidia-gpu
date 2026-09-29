@@ -25,10 +25,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
@@ -48,6 +50,11 @@ const (
 	// for too long from serving other device preparation/unpreparation
 	// requests.
 	driverChangeTimeout = 15 * time.Second
+)
+
+const (
+	// chroot exits with 127 when the command does not exist in the new root.
+	chrootCommandNotFoundExitCode = 127
 )
 
 type VfioPciManager struct {
@@ -188,6 +195,20 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
 				// fuser returns exit code 1 if no process is using the device.
 				if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 					return nil
+				}
+				// chroot returns exit code 127 if the host has no fuser (e.g. Talos).
+				if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == chrootCommandNotFoundExitCode {
+					holders, scanErr := findFileUsers(vm.nvlib.hostRoot, gpuDeviceNode)
+					if scanErr == nil && len(holders) == 0 {
+						return nil
+					}
+					if scanErr != nil {
+						err = fmt.Errorf("unexpected error checking if gpu device %q is free: fuser is not available on the host and scanning host processes failed: %w", info.PciBusID, scanErr)
+					} else {
+						err = fmt.Errorf("gpu device %q has open fds by process(es): %q", info.PciBusID, strings.Join(holders, ", "))
+					}
+					klog.V(6).Infof("%v", err)
+					continue
 				}
 				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, cmdErr)
 				klog.V(6).Infof("[DEBUG] %s", err.Error())
@@ -395,6 +416,139 @@ func (vm *VfioPciManager) enableGPUPersistenceMode(pciAddress string) error {
 }
 
 // Disable GPU Persistence Mode.
+// hostRootPersistencedRunning reports whether nvidia-persistenced's socket
+// exists under the host root. It covers hosts whose driver root is not the root
+// filesystem but which run the daemon from it (e.g. Talos: driver under
+// /usr/local, socket under /run), where the driver-root check misses it.
+func (vm *VfioPciManager) hostRootPersistencedRunning() bool {
+	if vm.nvlib.hostRoot == "" {
+		return false
+	}
+	socket := filepath.Join(vm.nvlib.hostRoot, nvidiaPersistencedSocketPath)
+	klog.V(4).Infof("Checking if nvidia-persistenced is running: %s", socket)
+	_, err := os.Stat(socket)
+	if err != nil && !os.IsNotExist(err) {
+		klog.V(4).Infof("Error checking nvidia-persistenced socket %s: %v", socket, err)
+	}
+	return err == nil
+}
+
+// tryDisableGPUPersistenceModeFromHostRoot disables persistence mode through
+// the host driver's nvidia-smi, run chrooted into the host root so it reaches
+// the host's nvidia-persistenced. It is best effort: on failure it only logs,
+// leaving the caller to proceed exactly as when the daemon is not detected.
+func (vm *VfioPciManager) tryDisableGPUPersistenceModeFromHostRoot(pciAddress string) {
+	nvidiaSMI, err := hostRootBinaryPath(vm.nvlib.hostRoot, vm.hostDriverRoot, "nvidia-smi")
+	if err != nil {
+		klog.Warningf("nvidia-persistenced is running on the host but persistence mode for GPU %q cannot be disabled: %v", pciAddress, err)
+		return
+	}
+	if err := vm.nvlib.disableGPUPersistenceModeInRoot(pciAddress, vm.nvlib.hostRoot, nvidiaSMI); err != nil {
+		klog.Warningf("Error disabling persistence mode for GPU %q from the host root: %v", pciAddress, err)
+	}
+}
+
+// hostRootBinaryPath locates a driver binary under hostRoot/hostDriverRoot and
+// returns its path relative to hostRoot, for running it chrooted into hostRoot.
+func hostRootBinaryPath(hostRoot, hostDriverRoot, name string) (string, error) {
+	path, err := root(filepath.Join(hostRoot, hostDriverRoot)).getNvidiaSMIPath()
+	if err != nil {
+		return "", err
+	}
+	resolvedHostRoot, err := filepath.EvalSymlinks(hostRoot)
+	if err != nil {
+		return "", fmt.Errorf("error resolving host root %q: %w", hostRoot, err)
+	}
+	rel, err := filepath.Rel(resolvedHostRoot, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("%q resolves to %q, outside the host root %q", name, path, hostRoot)
+	}
+	return "/" + rel, nil
+}
+
+// findFileUsers is a fallback for `chroot <hostRoot> fuser <path>` on hosts
+// without fuser. Like fuser, it reports the processes (as "<pid> (<comm>)")
+// whose open file descriptors or memory mappings refer to the same file
+// (device and inode) as path, resolved inside hostRoot, by scanning
+// <hostRoot>/proc. As with fuser, a path that does not exist has no users.
+// Processes that exit or cannot be read mid-scan are skipped.
+func findFileUsers(hostRoot, path string) ([]string, error) {
+	var target unix.Stat_t
+	if err := unix.Stat(filepath.Join(hostRoot, path), &target); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error stating %q: %w", path, err)
+	}
+	targetDev, targetIno := uint64(target.Dev), uint64(target.Ino) //nolint:gosec,unconvert
+
+	procRoot := filepath.Join(hostRoot, "proc")
+	procs, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, fmt.Errorf("error listing %q: %w", procRoot, err)
+	}
+	var users []string
+	for _, p := range procs {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		procDir := filepath.Join(procRoot, p.Name())
+		if procHasOpenFile(procDir, targetDev, targetIno) || procHasMappedFile(procDir, targetDev, targetIno) {
+			comm, _ := os.ReadFile(filepath.Join(procDir, "comm"))
+			users = append(users, fmt.Sprintf("%s (%s)", p.Name(), strings.TrimSpace(string(comm))))
+		}
+	}
+	return users, nil
+}
+
+func procHasOpenFile(procDir string, dev, ino uint64) bool {
+	fdDir := filepath.Join(procDir, "fd")
+	fds, err := os.ReadDir(fdDir)
+	if err != nil {
+		return false
+	}
+	for _, fd := range fds {
+		var st unix.Stat_t
+		if err := unix.Stat(filepath.Join(fdDir, fd.Name()), &st); err != nil {
+			continue
+		}
+		if uint64(st.Dev) == dev && uint64(st.Ino) == ino { //nolint:gosec,unconvert
+			return true
+		}
+	}
+	return false
+}
+
+// procHasMappedFile checks /proc/<pid>/maps, whose lines read
+// "<addr> <perms> <offset> <major>:<minor> <inode> [<path>]" with the device
+// numbers in hex.
+func procHasMappedFile(procDir string, dev, ino uint64) bool {
+	maps, err := os.ReadFile(filepath.Join(procDir, "maps"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(maps), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		major, minor, ok := strings.Cut(fields[3], ":")
+		if !ok {
+			continue
+		}
+		mapMajor, err1 := strconv.ParseUint(major, 16, 32)
+		mapMinor, err2 := strconv.ParseUint(minor, 16, 32)
+		mapInode, err3 := strconv.ParseUint(fields[4], 10, 64)
+		if err1 != nil || err2 != nil || err3 != nil {
+			continue
+		}
+		if mapInode == ino && unix.Mkdev(uint32(mapMajor), uint32(mapMinor)) == dev {
+			return true
+		}
+	}
+	return false
+}
+
 func (vm *VfioPciManager) disableGPUPersistenceMode(pciAddress string) error {
 	// Obtain a lock to serialize persistence mode operations.
 	// This is a cautious approach to avoid any NVML race conditions.
@@ -406,6 +560,10 @@ func (vm *VfioPciManager) disableGPUPersistenceMode(pciAddress string) error {
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("error checking if nvidia-persistenced is running: %w", err)
+		}
+		if vm.hostRootPersistencedRunning() {
+			vm.tryDisableGPUPersistenceModeFromHostRoot(pciAddress)
+			return nil
 		}
 		klog.V(4).Infof("nvidia-persistenced is not running; nothing to do...")
 		return nil
