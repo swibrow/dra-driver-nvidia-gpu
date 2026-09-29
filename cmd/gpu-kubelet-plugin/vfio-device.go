@@ -25,10 +25,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
@@ -42,8 +44,13 @@ const (
 	vfioDevicesPath              = "/dev/vfio/devices"
 	iommuDevicePath              = "/dev/iommu"
 	nvidiaPersistencedSocketPath = "/run/nvidia-persistenced/socket"
-	gpuFreeCheckInterval         = 1 * time.Second
-	gpuFreeCheckTimeout          = 60 * time.Second
+	// The kubelet plugin mounts the host's /proc here when PassthroughSupport
+	// is enabled, so it lists every process in the host PID namespace.
+	procRoot = "/proc"
+	// NV_MAJOR_DEVICE_NUMBER: /dev/nvidia<minor> is always char device 195:<minor>.
+	nvidiaDeviceMajor    = 195
+	gpuFreeCheckInterval = 1 * time.Second
+	gpuFreeCheckTimeout  = 60 * time.Second
 	// Keep driverChangeTimeout short to avoid blocking the plugin process
 	// for too long from serving other device preparation/unpreparation
 	// requests.
@@ -161,13 +168,12 @@ func (vm *VfioPciManager) Configure(ctx context.Context, info *VfioDeviceInfo) e
 // WaitForGPUFree does a best effort scan of the GPU clients running on the host and
 // waits for them to exit on their own.
 //
-// This polls the GPU's /dev/nvidia* device node in the driver installation path on
-// the host periodically to see if any process has open fds to it. This acts as a
-// limited safety net to ensure that we don't mistakenly try to unbind a GPU from
-// the nvidia driver while it is busy.
-// Note: Here, we can only check if there are any GPU clients running on the host rootfs
-// where the driver is installed. If you have containerized GPU clients that work
-// with their own view of the device nodes, we will not able to detect it.
+// This polls the open file descriptors of every process in the host PID namespace
+// for the GPU's /dev/nvidia* character device, matched by device number rather
+// than path. That covers containerized GPU clients with their own view of the
+// device nodes, and needs no host tooling such as fuser, which minimal host OSes
+// like Talos do not ship. It acts as a limited safety net to ensure that we don't
+// mistakenly try to unbind a GPU from the nvidia driver while it is busy.
 func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceInfo) error {
 	if info.parent == nil {
 		return nil
@@ -176,27 +182,61 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
 	ticker := time.NewTicker(gpuFreeCheckInterval)
 	defer ticker.Stop()
 
-	gpuDeviceNode := filepath.Join(vm.hostDriverRoot, "dev", fmt.Sprintf("nvidia%d", info.parent.minor))
 	var err error
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-timeout:
 			return fmt.Errorf("timed out waiting for gpu to be free: %w", err)
 		case <-ticker.C:
-			out, cmdErr := execCommandWithChroot(vm.nvlib.hostRoot, "fuser", []string{gpuDeviceNode}) //nolint:gosec
-			if cmdErr != nil {
-				// fuser returns exit code 1 if no process is using the device.
-				if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-					return nil
-				}
-				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, cmdErr)
+			holders, scanErr := findCharDeviceHolders(procRoot, nvidiaDeviceMajor, uint32(info.parent.minor)) //nolint:gosec
+			if scanErr != nil {
+				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
 				klog.V(6).Infof("[DEBUG] %s", err.Error())
 				continue
 			}
-			err = fmt.Errorf("gpu device %q has open fds by process(es): %q", info.PciBusID, string(out))
-			klog.V(6).Infof("[DEBUG] %s", err.Error())
+			if len(holders) == 0 {
+				return nil
+			}
+			err = fmt.Errorf("gpu device %q has open fds by process(es): %s", info.PciBusID, strings.Join(holders, ", "))
+			klog.V(4).Infof("%s", err.Error())
 		}
 	}
+}
+
+// findCharDeviceHolders returns "<pid> (<comm>)" for every process under procRoot
+// holding an open fd to the character device major:minor. Processes that exit or
+// whose fds cannot be read mid-scan are skipped.
+func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, error) {
+	procs, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, fmt.Errorf("error listing %q: %w", procRoot, err)
+	}
+	var holders []string
+	for _, p := range procs {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		fdDir := filepath.Join(procRoot, p.Name(), "fd")
+		fds, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			var st unix.Stat_t
+			if err := unix.Stat(filepath.Join(fdDir, fd.Name()), &st); err != nil {
+				continue
+			}
+			rdev := uint64(st.Rdev) //nolint:gosec,unconvert
+			if uint32(st.Mode)&unix.S_IFMT == unix.S_IFCHR && unix.Major(rdev) == major && unix.Minor(rdev) == minor {
+				comm, _ := os.ReadFile(filepath.Join(procRoot, p.Name(), "comm"))
+				holders = append(holders, fmt.Sprintf("%s (%s)", p.Name(), strings.TrimSpace(string(comm))))
+				break
+			}
+		}
+	}
+	return holders, nil
 }
 
 // Unconfigure binds the GPU to the nvidia driver.
