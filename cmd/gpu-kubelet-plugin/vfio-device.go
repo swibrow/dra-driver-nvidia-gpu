@@ -25,10 +25,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
@@ -42,6 +44,11 @@ const (
 	vfioDevicesPath              = "/dev/vfio/devices"
 	iommuDevicePath              = "/dev/iommu"
 	nvidiaPersistencedSocketPath = "/run/nvidia-persistenced/socket"
+	// The kubelet plugin mounts the host's /proc here when PassthroughSupport
+	// is enabled, so it lists every process in the host PID namespace.
+	procRoot = "/proc"
+	// NV_MAJOR_DEVICE_NUMBER: /dev/nvidia<minor> is always char device 195:<minor>.
+	nvidiaDeviceMajor = 195
 	gpuFreeCheckInterval         = 1 * time.Second
 	gpuFreeCheckTimeout          = 60 * time.Second
 	// Keep driverChangeTimeout short to avoid blocking the plugin process
@@ -189,11 +196,21 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
 				if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 					return nil
 				}
-				// chroot exits 127 when the host has no fuser (e.g. Talos), so the
-				// check can never pass there; skip it instead of timing out.
+				// chroot exits 127 when the host has no fuser (e.g. Talos), so
+				// scan the host's /proc for the device instead.
 				if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == 127 {
-					klog.Warningf("Skipping the check for processes using gpu device %q: fuser is not available on the host", info.PciBusID)
-					return nil
+					holders, scanErr := findCharDeviceHolders(procRoot, nvidiaDeviceMajor, uint32(info.parent.minor)) //nolint:gosec
+					if scanErr != nil {
+						err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
+						klog.V(6).Infof("[DEBUG] %s", err.Error())
+						continue
+					}
+					if len(holders) == 0 {
+						return nil
+					}
+					err = fmt.Errorf("gpu device %q has open fds by process(es): %s", info.PciBusID, strings.Join(holders, ", "))
+					klog.V(4).Infof("%s", err.Error())
+					continue
 				}
 				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, cmdErr)
 				klog.V(6).Infof("%v", err)
@@ -203,6 +220,42 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
 			klog.V(6).Infof("%v", err)
 		}
 	}
+}
+
+// findCharDeviceHolders returns "<pid> (<comm>)" for every process under procRoot
+// holding an open fd to the character device major:minor. Matching by device
+// number rather than path also catches containerized clients with their own
+// device nodes. Processes that exit or whose fds cannot be read mid-scan are
+// skipped.
+func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, error) {
+	procs, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, fmt.Errorf("error listing %q: %w", procRoot, err)
+	}
+	var holders []string
+	for _, p := range procs {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
+			continue
+		}
+		fdDir := filepath.Join(procRoot, p.Name(), "fd")
+		fds, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			var st unix.Stat_t
+			if err := unix.Stat(filepath.Join(fdDir, fd.Name()), &st); err != nil {
+				continue
+			}
+			rdev := uint64(st.Rdev) //nolint:gosec,unconvert
+			if uint32(st.Mode)&unix.S_IFMT == unix.S_IFCHR && unix.Major(rdev) == major && unix.Minor(rdev) == minor {
+				comm, _ := os.ReadFile(filepath.Join(procRoot, p.Name(), "comm"))
+				holders = append(holders, fmt.Sprintf("%s (%s)", p.Name(), strings.TrimSpace(string(comm))))
+				break
+			}
+		}
+	}
+	return holders, nil
 }
 
 // Unconfigure binds the GPU to the nvidia driver.
