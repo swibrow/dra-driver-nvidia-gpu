@@ -48,9 +48,9 @@ const (
 	// is enabled, so it lists every process in the host PID namespace.
 	procRoot = "/proc"
 	// NV_MAJOR_DEVICE_NUMBER: /dev/nvidia<minor> is always char device 195:<minor>.
-	nvidiaDeviceMajor = 195
-	gpuFreeCheckInterval         = 1 * time.Second
-	gpuFreeCheckTimeout          = 60 * time.Second
+	nvidiaDeviceMajor    = 195
+	gpuFreeCheckInterval = 1 * time.Second
+	gpuFreeCheckTimeout  = 60 * time.Second
 	// Keep driverChangeTimeout short to avoid blocking the plugin process
 	// for too long from serving other device preparation/unpreparation
 	// requests.
@@ -383,7 +383,7 @@ func (vm *VfioPciManager) changeDriver(pciAddress, driver string) error {
 	}
 
 	if currentDriver != "" {
-		err := vm.nvlib.nvpasst.Unbind(pciAddress)
+		err := unbindDevice(pciAddress)
 		if err != nil {
 			return fmt.Errorf("error unbinding GPU %q from driver %q: %w", pciAddress, currentDriver, err)
 		}
@@ -392,6 +392,30 @@ func (vm *VfioPciManager) changeDriver(pciAddress, driver string) error {
 	err = vm.nvlib.nvpasst.BindToDriver(pciAddress, driver)
 	if err != nil {
 		return fmt.Errorf("error binding GPU %q to driver %q: %w", pciAddress, driver, err)
+	}
+
+	// The GPU is already on vfio here, so this only moves its graphics
+	// auxiliary (HDMI audio) function, which a VM needs alongside it.
+	if driver != nvidiaDriver {
+		err = vm.nvlib.nvpasst.BindToVFIODriver(pciAddress)
+		if err != nil {
+			return fmt.Errorf("error binding auxiliary devices of GPU %q to vfio: %w", pciAddress, err)
+		}
+	}
+	return nil
+}
+
+// Unbind only the GPU function. nvpassthrough.Unbind also unbinds the graphics
+// auxiliary function and clears its driver_override, and nothing binds it
+// back, so a host that keeps it on vfio-pci for passthrough loses it on every
+// driver switch.
+func unbindDevice(pciAddress string) error {
+	devicePath := filepath.Join(pciDevicesPath, pciAddress)
+	if err := os.WriteFile(filepath.Join(devicePath, "driver_override"), []byte("\n"), 0644); err != nil {
+		return fmt.Errorf("failed to clear driver_override: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(devicePath, "driver", "unbind"), []byte(pciAddress), 0644); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("failed to unbind: %w", err)
 	}
 	return nil
 }
