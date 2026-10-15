@@ -17,42 +17,72 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"slices"
-	"strings"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestFindCharDeviceHolders(t *testing.T) {
-	self := fmt.Sprintf("%d ", os.Getpid())
-	hasSelf := func(holders []string) bool {
-		return slices.ContainsFunc(holders, func(h string) bool { return strings.HasPrefix(h, self) })
-	}
-
 	f, err := os.Open("/dev/null")
-	if err != nil {
-		t.Fatalf("open /dev/null: %v", err)
-	}
+	require.NoError(t, err)
 	defer f.Close()
 
-	holders, err := findCharDeviceHolders("/proc", 1, 3)
-	if err != nil {
-		t.Fatalf("findCharDeviceHolders: %v", err)
-	}
-	if !hasSelf(holders) {
-		t.Errorf("expected %q among holders of 1:3, got %v", self, holders)
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	self := fmt.Sprintf("%d(%s)", os.Getpid(), filepath.Base(exe))
+
+	tests := map[string]struct {
+		procRoot     string
+		major, minor uint32
+		wantSelf     bool
+		wantErr      bool
+	}{
+		"device held by this process": {
+			procRoot: "/proc",
+			major:    1,
+			minor:    3,
+			wantSelf: true,
+		},
+		"device not held by this process": {
+			procRoot: "/proc",
+			major:    nvidiaDeviceMajor,
+			minor:    4095,
+		},
+		"missing proc root": {
+			procRoot: filepath.Join(t.TempDir(), "missing"),
+			major:    1,
+			minor:    3,
+			wantErr:  true,
+		},
 	}
 
-	holders, err = findCharDeviceHolders("/proc", nvidiaDeviceMajor, 4095)
-	if err != nil {
-		t.Fatalf("findCharDeviceHolders: %v", err)
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			holders, err := findCharDeviceHolders(tc.procRoot, tc.major, tc.minor)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			if tc.wantSelf {
+				require.Contains(t, holders, self)
+			} else {
+				require.NotContains(t, holders, self)
+			}
+		})
 	}
-	if hasSelf(holders) {
-		t.Errorf("did not expect %q among holders of %d:4095, got %v", self, nvidiaDeviceMajor, holders)
-	}
+}
 
-	if _, err := findCharDeviceHolders(t.TempDir()+"/missing", 1, 3); err == nil {
-		t.Error("expected an error for a missing proc root")
-	}
+func TestWaitForGPUFree(t *testing.T) {
+	vm := &VfioPciManager{}
+	info := &VfioDeviceInfo{parent: &GpuInfo{minor: 4095}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, vm.WaitForGPUFree(ctx, info))
 }
